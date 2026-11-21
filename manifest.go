@@ -2,7 +2,9 @@ package main
 
 import (
 	"crypto/md5"
+	"crypto/sha1"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -27,37 +29,15 @@ func buildManifest(root string) error {
 		return fmt.Errorf("charts is not a directory")
 	}
 
+	candidateFolders, err := discoverChartFolders(chartsDir)
+	if err != nil {
+		return err
+	}
+
 	manifest := struct {
 		Charts []ParsedChart `json:"charts"`
 	}{
 		Charts: []ParsedChart{},
-	}
-
-	candidateFolders := []string{}
-	err = filepath.WalkDir(chartsDir, func(path string, d os.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		if d.IsDir() {
-			return nil
-		}
-		if d.Name() != "maidata.txt" {
-			return nil
-		}
-		dir := filepath.Dir(path)
-		rel, err := filepath.Rel(chartsDir, dir)
-		if err != nil {
-			return err
-		}
-		rel = filepath.ToSlash(rel)
-		if rel == "." {
-			return nil
-		}
-		candidateFolders = append(candidateFolders, rel)
-		return nil
-	})
-	if err != nil {
-		return err
 	}
 
 	type chartResult struct {
@@ -140,6 +120,55 @@ func buildManifest(root string) error {
 	return nil
 }
 
+func discoverChartFolders(chartsDir string) ([]string, error) {
+	candidateFolders := []string{}
+	err := filepath.WalkDir(chartsDir, func(path string, d os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if d.IsDir() || d.Name() != "maidata.txt" {
+			return nil
+		}
+		dir := filepath.Dir(path)
+		rel, err := filepath.Rel(chartsDir, dir)
+		if err != nil {
+			return err
+		}
+		rel = filepath.ToSlash(rel)
+		if rel != "." {
+			candidateFolders = append(candidateFolders, rel)
+		}
+		return nil
+	})
+	if errors.Is(err, os.ErrNotExist) {
+		return []string{}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return candidateFolders, nil
+}
+
+// The fixed namespace keeps folder-derived chart IDs stable across restarts.
+var chartIDNamespace = [16]byte{
+	0x42, 0x2d, 0x7d, 0x5a, 0x8c, 0x1f, 0x4c, 0x2b,
+	0x9a, 0x61, 0x33, 0x45, 0x7e, 0x90, 0x1f, 0x6a,
+}
+
 func chartIDForFolder(folder string) string {
-	return base64.RawURLEncoding.EncodeToString([]byte(folder))
+	name := filepath.ToSlash(filepath.Clean(folder))
+	input := append(chartIDNamespace[:], []byte(name)...)
+	hash := sha1.Sum(input)
+	id := hash[:16]
+	id[6] = (id[6] & 0x0f) | 0x50
+	id[8] = (id[8] & 0x3f) | 0x80
+
+	encoded := hex.EncodeToString(id)
+	return fmt.Sprintf("%s-%s-%s-%s-%s",
+		encoded[:8],
+		encoded[8:12],
+		encoded[12:16],
+		encoded[16:20],
+		encoded[20:],
+	)
 }
