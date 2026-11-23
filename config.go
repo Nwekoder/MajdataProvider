@@ -11,9 +11,8 @@ import (
 )
 
 type serverConfig struct {
-	InviteCode    string `json:"invite_code"`
-	DanAdminToken string `json:"dan_admin_token"`
-	DBPath        string `json:"db_path"`
+	InviteCode string `json:"invite_code"`
+	DBPath     string `json:"db_path"`
 }
 
 func loadServerConfig(path string) (serverConfig, error) {
@@ -42,9 +41,6 @@ func loadServerConfig(path string) (serverConfig, error) {
 
 	if value, ok := os.LookupEnv("MAJDATA_INVITE_CODE"); ok && value != "" {
 		config.InviteCode = value
-	}
-	if value, ok := os.LookupEnv("MAJDATA_DAN_ADMIN_TOKEN"); ok && value != "" {
-		config.DanAdminToken = value
 	}
 	if value, ok := os.LookupEnv("MAJDATA_DB_PATH"); ok && value != "" {
 		config.DBPath = value

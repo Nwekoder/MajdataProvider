@@ -5,12 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 )
 
@@ -18,36 +15,6 @@ const (
 	publicCollectionCreator = "Majdata Provider"
 	maxCollectionPageSize   = 100
 )
-
-var maimaiSeriesReleaseDates = map[string]string{
-	"maimai":                  "2012-07-11",
-	"maimai PLUS":             "2012-12-13",
-	"maimai GreeN":            "2013-07-11",
-	"maimai GreeN PLUS":       "2014-01-31",
-	"maimai ORANGE":           "2014-09-18",
-	"maimai ORANGE PLUS":      "2015-03-19",
-	"maimai PiNK":             "2015-12-09",
-	"maimai PiNK PLUS":        "2016-06-30",
-	"maimai MURASAKi":         "2016-12-15",
-	"maimai MURASAKi PLUS":    "2017-06-22",
-	"maimai MiLK":             "2017-12-14",
-	"maimai MiLK PLUS":        "2018-06-21",
-	"maimai FiNALE":           "2018-12-13",
-	"maimai DX":               "2019-07-11",
-	"maimai DX PLUS":          "2020-01-23",
-	"maimai DX Splash":        "2020-09-17",
-	"maimai DX Splash PLUS":   "2021-03-18",
-	"maimai DX UNiVERSE":      "2021-09-16",
-	"maimai DX UNiVERSE PLUS": "2022-03-24",
-	"maimai DX FESTiVAL":      "2022-09-15",
-	"maimai DX FESTiVAL PLUS": "2023-03-23",
-	"maimai DX BUDDiES":       "2023-09-14",
-	"maimai DX BUDDiES PLUS":  "2024-03-21",
-	"maimai DX PRiSM":         "2024-09-12",
-	"maimai DX PRiSM PLUS":    "2025-03-13",
-	"maimai DX CiRCLE":        "2025-09-18",
-	"maimai DX CiRCLE PLUS":   "2026-03-19",
-}
 
 type publicCollection struct {
 	ID          string   `json:"id"`
@@ -57,7 +24,6 @@ type publicCollection struct {
 	Count       int      `json:"count"`
 	Items       []string `json:"items"`
 	SongHashs   []string `json:"songHashs"`
-	folderName  string
 }
 
 type collectionPlaylistDefinition struct {
@@ -95,7 +61,6 @@ type publicCollectionHashList struct {
 	SongHashs       []string `json:"songHashs"`
 	IsPlayList      bool     `json:"isPlayList"`
 	IsForceGameover bool     `json:"isForceGameover"`
-	SongLevels      []int    `json:"songLevels,omitempty"`
 }
 
 func cleanupEmptyUncategorized(root string) error {
@@ -176,7 +141,6 @@ func buildPublicCollections(root string, catalog map[string]chartCatalogEntry) (
 			Description: "Playlist from collections/" + filepath.ToSlash(dirEntry.Name()) + "/playlist.json.",
 			Items:       make([]string, 0, len(definition.LevelIDs)),
 			SongHashs:   make([]string, 0, len(definition.LevelIDs)),
-			folderName:  dirEntry.Name(),
 		}
 		for _, songID := range definition.LevelIDs {
 			entry, exists := chartsBySongID[songID]
@@ -190,16 +154,12 @@ func buildPublicCollections(root string, catalog map[string]chartCatalogEntry) (
 		result = append(result, collection)
 	}
 
-	sort.SliceStable(result, func(i, j int) bool {
-		leftDate, leftIsSeries := maimaiSeriesReleaseDates[result[i].folderName]
-		rightDate, rightIsSeries := maimaiSeriesReleaseDates[result[j].folderName]
-		if leftIsSeries != rightIsSeries {
-			return leftIsSeries
+	sort.Slice(result, func(i, j int) bool {
+		left, right := strings.ToLower(result[i].Name), strings.ToLower(result[j].Name)
+		if left != right {
+			return left < right
 		}
-		if leftIsSeries && leftDate != rightDate {
-			return leftDate < rightDate
-		}
-		return strings.ToLower(result[i].Name) < strings.ToLower(result[j].Name)
+		return result[i].ID < result[j].ID
 	})
 	if err := writeCollectionManifest(collectionsDir, result); err != nil {
 		return nil, err
@@ -218,142 +178,4 @@ func writeCollectionManifest(collectionsDir string, collections []publicCollecti
 	}
 	log.Printf("build path=%s file=%s", path, filepath.Base(path))
 	return nil
-}
-
-func servePublicCollectionList(collections []publicCollection) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		page, pageSize, ok := parseCollectionPagination(r.URL.Query())
-		if !ok {
-			writeAPIStatus(w, http.StatusBadRequest, 40000, "invalid pagination")
-			return
-		}
-		createdBy := strings.TrimSpace(r.URL.Query().Get("createdBy"))
-		keyword := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("keyword")))
-		matches := make([]publicCollectionListItem, 0, len(collections))
-		for _, collection := range collections {
-			if createdBy != "" && !strings.EqualFold(collection.CreatedBy, createdBy) {
-				continue
-			}
-			if keyword != "" &&
-				!strings.Contains(strings.ToLower(collection.Name), keyword) &&
-				!strings.Contains(strings.ToLower(collection.Description), keyword) {
-				continue
-			}
-			matches = append(matches, publicCollectionListItem{
-				ID:          collection.ID,
-				Name:        collection.Name,
-				CreatedBy:   collection.CreatedBy,
-				Description: collection.Description,
-				Count:       collection.Count,
-			})
-		}
-
-		if page > len(matches)/pageSize {
-			writeJSON(w, http.StatusOK, []publicCollectionListItem{})
-			return
-		}
-		start := page * pageSize
-		if start >= len(matches) {
-			writeJSON(w, http.StatusOK, []publicCollectionListItem{})
-			return
-		}
-		end := start + pageSize
-		if end > len(matches) {
-			end = len(matches)
-		}
-		writeJSON(w, http.StatusOK, matches[start:end])
-	}
-}
-
-func serveGameCollectionList(collections []publicCollection) func(http.ResponseWriter, *http.Request, account) {
-	return func(w http.ResponseWriter, r *http.Request, _ account) {
-		if r.Method != http.MethodGet {
-			w.Header().Set("Allow", http.MethodGet)
-			writeAPIStatus(w, http.StatusMethodNotAllowed, 40000, "method not allowed")
-			return
-		}
-		result := make([]publicCollectionHashList, 0, len(collections))
-		for _, collection := range collections {
-			result = append(result, publicCollectionHashList{
-				ID:              collection.ID,
-				Name:            collection.Name,
-				CreatedBy:       collection.CreatedBy,
-				Description:     collection.Description,
-				SongHashs:       collection.SongHashs,
-				IsPlayList:      true,
-				IsForceGameover: false,
-			})
-		}
-		writeJSON(w, http.StatusOK, result)
-	}
-}
-
-func parseCollectionPagination(query url.Values) (int, int, bool) {
-	page := 0
-	pageSize := 30
-	if value := query.Get("page"); value != "" {
-		parsed, err := strconv.Atoi(value)
-		if err != nil || parsed < 0 {
-			return 0, 0, false
-		}
-		page = parsed
-	}
-	if value := query.Get("pageSize"); value != "" {
-		parsed, err := strconv.Atoi(value)
-		if err != nil || parsed < 1 || parsed > maxCollectionPageSize {
-			return 0, 0, false
-		}
-		pageSize = parsed
-	}
-	return page, pageSize, true
-}
-
-func servePublicCollection(collections []publicCollection) http.HandlerFunc {
-	byID := make(map[string]publicCollection, len(collections))
-	for _, collection := range collections {
-		byID[strings.ToLower(collection.ID)] = collection
-	}
-
-	return func(w http.ResponseWriter, r *http.Request) {
-		parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
-		if len(parts) != 4 || parts[0] != "api" || parts[1] != "collection" {
-			http.NotFound(w, r)
-			return
-		}
-		collection, exists := byID[strings.ToLower(parts[2])]
-		if !exists {
-			writeAPIStatus(w, http.StatusNotFound, 40400, "collection not found")
-			return
-		}
-		if r.Method != http.MethodGet {
-			w.Header().Set("Allow", http.MethodGet)
-			writeAPIStatus(w, http.StatusMethodNotAllowed, 40000, "method not allowed")
-			return
-		}
-
-		switch parts[3] {
-		case "songlist":
-			writeJSON(w, http.StatusOK, publicCollectionSongList{
-				ID:          collection.ID,
-				Name:        collection.Name,
-				CreatedBy:   collection.CreatedBy,
-				Description: collection.Description,
-				Count:       collection.Count,
-				Visibility:  1,
-				Items:       collection.Items,
-			})
-		case "hashlist":
-			writeJSON(w, http.StatusOK, publicCollectionHashList{
-				ID:              collection.ID,
-				Name:            collection.Name,
-				CreatedBy:       collection.CreatedBy,
-				Description:     collection.Description,
-				SongHashs:       collection.SongHashs,
-				IsPlayList:      true,
-				IsForceGameover: false,
-			})
-		default:
-			http.NotFound(w, r)
-		}
-	}
 }

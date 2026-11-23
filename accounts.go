@@ -10,7 +10,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"html/template"
 	"log"
 	"net/http"
 	"regexp"
@@ -22,7 +21,7 @@ import (
 )
 
 const (
-	sessionCookieName = "majdata_session"
+	sessionCookieName = "token"
 	sessionDuration   = 30 * 24 * time.Hour
 	argonMemory       = 64 * 1024
 	argonIterations   = 2
@@ -35,10 +34,9 @@ var passwordHashSlots = make(chan struct{}, 2)
 var dummyPasswordSalt = []byte("MajdataProviderDummySalt")
 
 type application struct {
-	store         *sql.DB
-	inviteCode    string
-	danAdminToken string
-	catalog       map[string]chartCatalogEntry
+	store      *sql.DB
+	inviteCode string
+	catalog    map[string]chartCatalogEntry
 }
 
 type account struct {
@@ -52,116 +50,6 @@ type apiStatus struct {
 	Message string `json:"message,omitempty"`
 }
 
-var registrationTemplate = template.Must(template.New("register").Parse(`<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Register - Majdata Provider</title>
-</head>
-<body>
-  <main>
-    <h1>Create an account</h1>
-    {{if .Message}}<p role="status">{{.Message}}</p>{{end}}
-    {{if .Enabled}}
-    <form method="post" action="/register">
-      <input type="hidden" name="csrf" value="{{.CSRF}}">
-      <label>Invite code <input name="invite_code" type="password" required autocomplete="off"></label>
-      <label>Username <input name="username" minlength="3" maxlength="32" pattern="[A-Za-z0-9_.-]+" required autocomplete="username"></label>
-      <label>Password <input name="password" type="password" minlength="10" maxlength="128" required autocomplete="new-password"></label>
-      <button type="submit">Register</button>
-    </form>
-    {{end}}
-  </main>
-</body>
-</html>`))
-
-func (app *application) serveRegistration(w http.ResponseWriter, r *http.Request) {
-	setSecurityHeaders(w)
-	w.Header().Set("Cache-Control", "no-store")
-	if r.URL.Path != "/register" {
-		http.NotFound(w, r)
-		return
-	}
-	if r.Method != http.MethodGet && r.Method != http.MethodPost {
-		w.Header().Set("Allow", "GET, POST")
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	if app.inviteCode == "" {
-		app.writeRegistrationPage(w, r, "", "Registration is not configured by the server administrator.", false)
-		return
-	}
-	if r.Method == http.MethodGet {
-		token, err := randomToken(32)
-		if err != nil {
-			log.Printf("registration_csrf_error err=%v", err)
-			http.Error(w, "registration is temporarily unavailable", http.StatusInternalServerError)
-			return
-		}
-		http.SetCookie(w, &http.Cookie{
-			Name:     "majdata_register_csrf",
-			Value:    token,
-			Path:     "/register",
-			Secure:   isSecureRequest(r),
-			SameSite: http.SameSiteStrictMode,
-			MaxAge:   3600,
-		})
-		app.writeRegistrationPage(w, r, token, "", true)
-		return
-	}
-
-	r.Body = http.MaxBytesReader(w, r.Body, 16<<10)
-	if err := r.ParseForm(); err != nil {
-		http.Error(w, "invalid registration form", http.StatusBadRequest)
-		return
-	}
-	cookie, err := r.Cookie("majdata_register_csrf")
-	if err != nil || !validCSRF(cookie.Value, r.FormValue("csrf")) {
-		app.writeRegistrationPage(w, r, "", "The form expired. Reload the page and try again.", true)
-		return
-	}
-	csrfToken := cookie.Value
-
-	invite := r.FormValue("invite_code")
-	if len(invite) != len(app.inviteCode) || subtle.ConstantTimeCompare([]byte(invite), []byte(app.inviteCode)) != 1 {
-		app.writeRegistrationPage(w, r, csrfToken, "The invite code is invalid.", true)
-		return
-	}
-	username := strings.TrimSpace(r.FormValue("username"))
-	password := r.FormValue("password")
-	if !usernamePattern.MatchString(username) || !validRegistrationPassword(password) {
-		app.writeRegistrationPage(w, r, csrfToken, "Use a 3-32 character username (letters, numbers, _, . or -) and a 10-128 character password.", true)
-		return
-	}
-
-	if _, err := app.createAccount(r, username, password); err != nil {
-		if errors.Is(err, errUsernameExists) {
-			app.writeRegistrationPage(w, r, csrfToken, "That username is already in use.", true)
-			return
-		}
-		log.Printf("registration_error err=%v", err)
-		http.Error(w, "account registration failed", http.StatusInternalServerError)
-		return
-	}
-	http.Redirect(w, r, "/register?success=1", http.StatusSeeOther)
-}
-
-func (app *application) writeRegistrationPage(w http.ResponseWriter, r *http.Request, csrf, message string, enabled bool) {
-	if r.URL.Query().Get("success") == "1" {
-		message = "Account created. You can now log in from MajdataPlay."
-		enabled = false
-	}
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if err := registrationTemplate.Execute(w, struct {
-		CSRF    string
-		Message string
-		Enabled bool
-	}{CSRF: csrf, Message: message, Enabled: enabled}); err != nil {
-		log.Printf("registration_page_error err=%v", err)
-	}
-}
-
 func validRegistrationPassword(password string) bool {
 	return utf8.ValidString(password) && utf8.RuneCountInString(password) >= 10 && utf8.RuneCountInString(password) <= 128
 }
@@ -169,7 +57,7 @@ func validRegistrationPassword(password string) bool {
 var errUsernameExists = errors.New("username already exists")
 
 func (app *application) createAccount(r *http.Request, username, password string) (account, error) {
-	id, err := randomToken(16)
+	id, err := randomObjectID()
 	if err != nil {
 		return account{}, fmt.Errorf("generate account ID: %w", err)
 	}
@@ -184,8 +72,8 @@ func (app *application) createAccount(r *http.Request, username, password string
 	}
 	createdAt := time.Now().UTC()
 	_, err = app.store.ExecContext(r.Context(),
-		"INSERT INTO users (id, username, password_salt, password_hash, created_at) VALUES (?, ?, ?, ?, ?)",
-		id, username, salt, passwordHash, createdAt.Format(time.RFC3339Nano))
+		"INSERT INTO users (id, username, nickname, password_salt, password_hash, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+		id, username, username, salt, passwordHash, createdAt.Format(time.RFC3339Nano))
 	if err != nil {
 		if strings.Contains(strings.ToLower(err.Error()), "unique") {
 			return account{}, errUsernameExists
@@ -202,13 +90,28 @@ func (app *application) serveLogin(w http.ResponseWriter, r *http.Request) {
 		writeAPIStatus(w, http.StatusMethodNotAllowed, 40000, "method not allowed")
 		return
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, 16<<10)
-	if err := r.ParseMultipartForm(1 << 20); err != nil {
-		writeAPIStatus(w, http.StatusBadRequest, 40001, "multipart form required")
-		return
+	var username, passwordDigest string
+	if strings.HasPrefix(strings.ToLower(r.Header.Get("Content-Type")), "application/json") {
+		var request struct {
+			Username string `json:"username"`
+			Password string `json:"password"`
+		}
+		if err := decodeJSONBody(w, r, 16<<10, &request); err != nil || request.Password == "" {
+			writeAPIStatus(w, http.StatusBadRequest, 40001, "invalid login data")
+			return
+		}
+		username = strings.TrimSpace(request.Username)
+		digest := md5.Sum([]byte(request.Password))
+		passwordDigest = hex.EncodeToString(digest[:])
+	} else {
+		r.Body = http.MaxBytesReader(w, r.Body, 16<<10)
+		if err := r.ParseMultipartForm(1 << 20); err != nil {
+			writeAPIStatus(w, http.StatusBadRequest, 40001, "multipart form required")
+			return
+		}
+		username = strings.TrimSpace(r.FormValue("username"))
+		passwordDigest = strings.ToLower(r.FormValue("password"))
 	}
-	username := strings.TrimSpace(r.FormValue("username"))
-	passwordDigest := strings.ToLower(r.FormValue("password"))
 	passwordBytes, err := hex.DecodeString(passwordDigest)
 	if err != nil || len(passwordBytes) != md5.Size || !usernamePattern.MatchString(username) {
 		writeAPIStatus(w, http.StatusUnauthorized, 60003, "invalid credentials")
@@ -263,6 +166,11 @@ func (app *application) serveLogin(w http.ResponseWriter, r *http.Request) {
 		writeAPIStatus(w, http.StatusInternalServerError, -114514, "login failed")
 		return
 	}
+	secure := isSecureRequest(r)
+	sameSite := http.SameSiteLaxMode
+	if secure {
+		sameSite = http.SameSiteNoneMode
+	}
 	http.SetCookie(w, &http.Cookie{
 		Name:     sessionCookieName,
 		Value:    token,
@@ -270,8 +178,8 @@ func (app *application) serveLogin(w http.ResponseWriter, r *http.Request) {
 		Expires:  expiry,
 		MaxAge:   int(sessionDuration.Seconds()),
 		HttpOnly: true,
-		Secure:   isSecureRequest(r),
-		SameSite: http.SameSiteLaxMode,
+		Secure:   secure,
+		SameSite: sameSite,
 	})
 	writeJSON(w, http.StatusOK, apiStatus{Code: 114514, Message: "success"})
 }
@@ -311,21 +219,6 @@ func (app *application) requireAccount(next func(http.ResponseWriter, *http.Requ
 	}
 }
 
-func (app *application) serveProfile(w http.ResponseWriter, r *http.Request, user account) {
-	writeJSON(w, http.StatusOK, struct {
-		ID       string    `json:"id"`
-		Username string    `json:"username"`
-		Nickname *string   `json:"nickname"`
-		Email    *string   `json:"email"`
-		AvatarID *string   `json:"avatarId"`
-		JoinDate time.Time `json:"joinDate"`
-	}{
-		ID:       user.ID,
-		Username: user.Username,
-		JoinDate: user.CreatedAt,
-	})
-}
-
 func (app *application) serveLogout(w http.ResponseWriter, r *http.Request, user account) {
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", http.MethodPost)
@@ -363,17 +256,6 @@ func randomToken(size int) (string, error) {
 		return "", err
 	}
 	return base64.RawURLEncoding.EncodeToString(value), nil
-}
-
-func validCSRF(cookieToken, formToken string) bool {
-	return cookieToken != "" && formToken != "" && subtle.ConstantTimeCompare([]byte(cookieToken), []byte(formToken)) == 1
-}
-
-func setSecurityHeaders(w http.ResponseWriter) {
-	w.Header().Set("Content-Security-Policy", "default-src 'none'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'; style-src 'unsafe-inline'")
-	w.Header().Set("X-Content-Type-Options", "nosniff")
-	w.Header().Set("X-Frame-Options", "DENY")
-	w.Header().Set("Referrer-Policy", "no-referrer")
 }
 
 func isSecureRequest(r *http.Request) bool {

@@ -1,5 +1,5 @@
 charts/
 data/
-collections
+collections/
 *_test.go
 server_config.json

@@ -30,6 +30,8 @@ func openStore(path string) (*sql.DB, error) {
 CREATE TABLE IF NOT EXISTS users (
     id TEXT PRIMARY KEY,
     username TEXT NOT NULL COLLATE NOCASE UNIQUE,
+    nickname TEXT NOT NULL DEFAULT '',
+    introduction TEXT,
     password_salt BLOB NOT NULL,
     password_hash BLOB NOT NULL,
     created_at TEXT NOT NULL
@@ -54,28 +56,40 @@ CREATE TABLE IF NOT EXISTS scores (
 );
 CREATE INDEX IF NOT EXISTS scores_user_chart_level ON scores(user_id, chart_id, chart_level);
 CREATE INDEX IF NOT EXISTS scores_chart_level ON scores(chart_id, chart_level);
-CREATE TABLE IF NOT EXISTS dan_courses (
+CREATE TABLE IF NOT EXISTS game_settings (
+    user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    settings_json TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS playlists (
     id TEXT PRIMARY KEY,
+    owner_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     name TEXT NOT NULL,
     description TEXT NOT NULL,
-    chart_ids TEXT NOT NULL,
-    song_levels TEXT NOT NULL DEFAULT '[]',
-    is_force_gameover INTEGER NOT NULL DEFAULT 0 CHECK (is_force_gameover IN (0, 1)),
+    visibility INTEGER NOT NULL CHECK (visibility IN (0, 1)),
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
-CREATE TABLE IF NOT EXISTS dan_admin_sessions (
-    token_hash BLOB PRIMARY KEY,
-    csrf_hash BLOB NOT NULL,
-    expires_at INTEGER NOT NULL
+CREATE INDEX IF NOT EXISTS playlists_owner_activity ON playlists(owner_id, updated_at DESC);
+CREATE TABLE IF NOT EXISTS playlist_items (
+    playlist_id TEXT NOT NULL REFERENCES playlists(id) ON DELETE CASCADE,
+    chart_id TEXT NOT NULL,
+    position INTEGER NOT NULL,
+    PRIMARY KEY (playlist_id, chart_id),
+    UNIQUE (playlist_id, position)
 );
-CREATE INDEX IF NOT EXISTS dan_admin_sessions_expiry ON dan_admin_sessions(expires_at);
+CREATE TABLE IF NOT EXISTS favorites (
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    collection_id TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (user_id, collection_id)
+);
 `
 	if _, err := db.Exec(schema); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("initialize SQLite schema: %w", err)
 	}
-	if err := ensureDanCourseSongLevelsColumn(db); err != nil {
+	if err := ensureUserProfileColumns(db); err != nil {
 		db.Close()
 		return nil, err
 	}
@@ -86,36 +100,43 @@ CREATE INDEX IF NOT EXISTS dan_admin_sessions_expiry ON dan_admin_sessions(expir
 	return db, nil
 }
 
-func ensureDanCourseSongLevelsColumn(db *sql.DB) error {
-	rows, err := db.Query("PRAGMA table_info(dan_courses)")
+func ensureUserProfileColumns(db *sql.DB) error {
+	rows, err := db.Query("PRAGMA table_info(users)")
 	if err != nil {
-		return fmt.Errorf("inspect Dan course schema: %w", err)
+		return fmt.Errorf("inspect user schema: %w", err)
 	}
-	hasColumn := false
+	hasNickname, hasIntroduction := false, false
 	for rows.Next() {
 		var cid, notNull, primaryKey int
 		var name, columnType string
 		var defaultValue sql.NullString
 		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
 			rows.Close()
-			return fmt.Errorf("read Dan course schema: %w", err)
+			return fmt.Errorf("read user schema: %w", err)
 		}
-		if name == "song_levels" {
-			hasColumn = true
+		switch name {
+		case "nickname":
+			hasNickname = true
+		case "introduction":
+			hasIntroduction = true
 		}
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
-		return fmt.Errorf("iterate Dan course schema: %w", err)
+		return fmt.Errorf("iterate user schema: %w", err)
 	}
 	if err := rows.Close(); err != nil {
-		return fmt.Errorf("close Dan course schema query: %w", err)
+		return fmt.Errorf("close user schema query: %w", err)
 	}
-	if hasColumn {
-		return nil
+	if !hasNickname {
+		if _, err := db.Exec("ALTER TABLE users ADD COLUMN nickname TEXT NOT NULL DEFAULT ''"); err != nil {
+			return fmt.Errorf("add user nickname column: %w", err)
+		}
 	}
-	if _, err := db.Exec("ALTER TABLE dan_courses ADD COLUMN song_levels TEXT NOT NULL DEFAULT '[]'"); err != nil {
-		return fmt.Errorf("add Dan course song levels column: %w", err)
+	if !hasIntroduction {
+		if _, err := db.Exec("ALTER TABLE users ADD COLUMN introduction TEXT"); err != nil {
+			return fmt.Errorf("add user introduction column: %w", err)
+		}
 	}
 	return nil
 }
